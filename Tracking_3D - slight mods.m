@@ -1,0 +1,310 @@
+function Tracking_3D()
+
+%Main Program
+
+% Create System objects used for reading video, detecting moving objects,
+% and displaying the results.
+
+obj = setupSystemObjects();
+
+stereoParams = importdata('stereoParams.mat');
+
+tracks = initializeTracks(); % Create an empty array of tracks.
+
+nextId = 1; % ID of the next track
+
+Nframe = 1;
+
+Colors = ['y';'m';'c';'r';'g';'b';'k';'y';'m';'c';'r';'g';'b';'k';'y';'m';'c';'r';'g';'b';'k';'y';'m';'c';'r';'g';'b';'k';'y';'m';'c';'r';'g';'b';'k';'y';'m';'c';'r';'g';'b';'k';'y';'m';'c';'r';'g';'b';'k';'y';'m';'c';'r';'g';'b';'k'];
+
+% Detect moving objects, and track them across video frames.
+while ~isDone(obj.readerL)
+    
+    frameL = obj.readerL();
+    
+    frameR = obj.readerR();
+    
+    [frameLeft, centroidsL, bboxesL, maskL,frameRight,centroidsR, bboxesR, maskR] = detectObjects(frameL,frameR);
+
+    positions3d = stereoCorrespondence();    
+    predictNewLocationsOfTracks();
+    [assignments, unassignedTracks, unassignedDetections] = detectionToTrackAssignment();
+        
+    updateAssignedTracks();
+    updateUnassignedTracks();
+    deleteLostTracks();
+    createNewTracks();
+    
+    displayTrackingResults();
+
+    pause(0.0001)
+          
+    Nframe = Nframe+1;
+end
+
+%% 1.Setup System Objects 
+
+function obj = setupSystemObjects()
+ 
+        % Initialize Video I/O
+        % Create objects for reading a video from a file, drawing the tracked
+        % objects in each frame, and playing the video.
+
+        % Create a video file reader.
+        obj.readerL = vision.VideoFileReader('V1L.mp4','ImageColorSpace','Intensity','VideoOutputDataType','uint8');
+        obj.readerR = vision.VideoFileReader('V1R.mp4','ImageColorSpace','Intensity','VideoOutputDataType','uint8');
+        
+        % Create two video players, one to display the video,
+        % and one to display the foreground mask.
+        obj.maskPlayer = vision.VideoPlayer('Position', [740, 400, 700, 400]);
+        obj.videoPlayer = vision.VideoPlayer('Position', [20, 400, 700, 400]);
+
+        % Create System objects for foreground detection and blob analysis
+
+        % The foreground detector is used to segment moving objects from
+        % the background. It outputs a binary mask, where the pixel value
+        % of 1 corresponds to the foreground and the value of 0 corresponds
+        % to the background.
+
+       obj.detectorL = vision.ForegroundDetector(...
+       'AdaptLearningRate',true,...
+       'NumTrainingFrames',10, ... 
+       'LearningRate',0.002,...
+       'MinimumBackgroundRatio',0.75,...
+       'NumGaussians',3,...
+       'InitialVariance', 30*30);
+
+       obj.detectorR = vision.ForegroundDetector(...
+       'AdaptLearningRate',true,...
+       'NumTrainingFrames',10, ... 
+       'LearningRate',0.002,...
+       'MinimumBackgroundRatio',0.75,...
+       'NumGaussians',3,...
+       'InitialVariance', 30*30);
+   
+        % Connected groups of foreground pixels are likely to correspond to moving
+        % objects.  The blob analysis System object is used to find such groups
+        % (called 'blobs' or 'connected components'), and compute their
+        % characteristics, such as area, centroid, and the bounding box.
+
+        obj.blobL = vision.BlobAnalysis(...
+       'CentroidOutputPort', true, ...
+       'AreaOutputPort', false, ...
+       'BoundingBoxOutputPort', true, ...
+       'MinimumBlobAreaSource', 'Property', 'MinimumBlobArea', 20);
+   
+       obj.blobR = vision.BlobAnalysis(...
+       'CentroidOutputPort', true, ...
+       'AreaOutputPort', false, ...
+       'BoundingBoxOutputPort', true, ...
+       'MinimumBlobAreaSource', 'Property', 'MinimumBlobArea', 20);
+   
+end
+
+%% 2. initializeTracks 
+
+function tracks = initializeTracks()
+        % create an empty array of tracks
+        tracks = struct(...
+            'id', {}, ...
+            'position3d',[], ...
+            'kalmanFilter', {}, ...
+            'age', {}, ...
+            'totalVisibleCount', {}, ...
+            'consecutiveInvisibleCount', {});
+end
+
+%% 3. detectObjects 
+
+function [frameLeft, centroidsL, bboxesL, maskL, frameRight, centroidsR, bboxesR, maskR] = detectObjects(frameL,frameR)
+
+        %Contrast enhancement
+        frameL = imadjust(frameL);
+        frameR = imadjust(frameR);
+        
+        %Rectify stereo images
+        [frameLeft,frameRight] = rectifyStereoImages(frameL,frameR,stereoParams);
+        
+        % Detect foreground.
+        maskL = obj.detectorL(frameLeft);
+        maskR = obj.detectorR(frameRight);
+
+        % Apply morphological operations to remove noise and fill in holes.
+        maskL = medfilt2(maskL,[5 5]);
+        maskR = medfilt2(maskR,[5 5]);
+
+        % Perform blob analysis to find connected components.
+        [centroidsL, bboxesL] = obj.blobL(maskL);
+        [centroidsR, bboxesR] = obj.blobR(maskR);
+end
+
+%% 4. predictNewLocationsOfTracks 
+  
+function predictNewLocationsOfTracks()
+
+        for i = 1:length(tracks)
+                      
+            % Predict the current location of the track.
+            tracks(i).position3d(Nframe,:) = predict(tracks(i).kalmanFilter);
+
+        end
+end
+
+%% 5. detectionToTrackAssignment 
+
+function [assignments, unassignedTracks, unassignedDetections] = detectionToTrackAssignment()
+
+        nTracks = length(tracks);
+        nDetections = size(centroidsL, 1);
+
+        % Compute the cost of assigning each detection to each track.
+        cost = zeros(nTracks, nDetections);
+            for i = 1:nTracks
+                cost(i, :) = distance(tracks(i).kalmanFilter, positions3d);
+            end
+
+        % Solve the assignment problem.
+        costOfNonAssignment = 20;
+        [assignments, unassignedTracks, unassignedDetections] = assignDetectionsToTracks(cost, costOfNonAssignment);
+end
+
+%% 6. updateAssignedTracks 
+
+function updateAssignedTracks()
+
+        numAssignedTracks = size(assignments, 1);
+        for i = 1:numAssignedTracks
+            trackIdx = assignments(i, 1);
+            detectionIdx = assignments(i, 2);
+            position3d = positions3d(detectionIdx, :);
+
+            % Correct the estimate of the object's location using the new detection.
+            tracks(trackIdx).position3d(Nframe,:) = correct(tracks(trackIdx).kalmanFilter, position3d);
+
+            % Update track's age.
+            tracks(trackIdx).age = tracks(trackIdx).age + 1;
+
+            % Update visibility.
+            tracks(trackIdx).totalVisibleCount = tracks(trackIdx).totalVisibleCount + 1;
+            tracks(trackIdx).consecutiveInvisibleCount = 0;
+        end
+        
+end
+
+%% 7. updateUnassignedTracks 
+
+function updateUnassignedTracks()
+  
+        for i = 1:length(unassignedTracks)
+            ind = unassignedTracks(i);
+            tracks(ind).age = tracks(ind).age + 1;
+            tracks(ind).consecutiveInvisibleCount = tracks(ind).consecutiveInvisibleCount + 1;
+        end
+end
+
+%% 8. deleteLostTracks 
+
+function deleteLostTracks()
+        if isempty(tracks)
+            return;
+        end
+
+        invisibleForTooLong = 20;
+        ageThreshold = 8;
+
+        % Compute the fraction of the track's age for which it was visible.
+        ages = [tracks(:).age];
+        totalVisibleCounts = [tracks(:).totalVisibleCount];
+        visibility = totalVisibleCounts ./ ages;
+
+        % Find the indices of 'lost' tracks.
+        lostInds = (ages < ageThreshold & visibility < 0.6) | [tracks(:).consecutiveInvisibleCount] >= invisibleForTooLong;
+
+        % Delete lost tracks.
+        tracks = tracks(~lostInds);
+end
+
+%% 9. createNewTracks
+
+function createNewTracks()
+
+        pos3d = positions3d(unassignedDetections, :);
+
+        for i = 1:size(pos3d, 1)
+
+            pos = pos3d(i,:);
+
+            % Create a Kalman filter object.
+            kalmanFilter = configureKalmanFilter('ConstantVelocity', ...
+                pos, [200, 50], [100, 25], 100);
+
+            % Create a new track.
+            newTrack = struct(...
+                'id', nextId, ...
+                'kalmanFilter', kalmanFilter, ...
+                'position3d',[0 0 0], ...
+                'age', 1, ...
+                'totalVisibleCount', 1, ...
+                'consecutiveInvisibleCount', 0);
+           
+            newTrack.position3d(Nframe,:) = pos;
+
+            % Add it to the array of tracks.
+            tracks(end + 1) = newTrack;
+
+            % Increment the next id.
+            nextId = nextId + 1;
+        end
+end
+
+%% 10. displayTrackingResults
+
+function displayTrackingResults()
+            
+        for t=1:(size(tracks,2))
+            scatter3(tracks(t).position3d(:,1),tracks(t).position3d(:,2),tracks(t).position3d(:,3),'filled','MarkerFaceColor',Colors(t))
+            hold on
+        end
+end
+
+%% 11. Stereo Correspondence
+
+function [position3d]=stereoCorrespondence()
+ position3d=[];
+   for i=1:size(centroidsL,1)
+              
+                BBL = bboxesL(i,:);
+                CL = centroidsL(i,:);
+                
+                xl = BBL(1)-15;
+                Xl = BBL(1)+BBL(3)+15;
+                szxl = xl:Xl;
+
+                yl = BBL(2)-15;
+                Yl = BBL(2)+BBL(4)+15;
+                szyl = yl:Yl;
+
+                SectL = gpuArray(frameLeft(szyl,szxl));
+                
+                xr = 1;
+                Xr = size(frameRight,2);
+                szxr = xr:Xr;
+
+                yr = BBL(2)-30;
+                Yr = BBL(2)+BBL(4)+30;
+                szyr = yr:Yr;
+
+                SectR = gpuArray(frameRight(szyr,szxr));
+                
+                c = normxcorr2(SectL,SectR);
+
+                [ypeak, xpeak] = find(c==max(c(:)));
+                xoffSet = gather(xpeak) -(size(SectL,2)/2);
+                
+                position3d(i,:) = triangulate([CL(1) CL(2)],[xoffSet CL(2)],stereoParams);    
+                
+   end
+
+end
+
+end
